@@ -9,7 +9,7 @@ use soroban_sdk::{
     symbol_short,
     testutils::{storage::Persistent as _, Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Bytes, BytesN, Env, String,
+    vec, Address, Bytes, BytesN, Env, Event, String,
 };
 
 fn setup_token(env: &Env, admin: &Address) -> Address {
@@ -9026,4 +9026,145 @@ fn test_pool_withdraw_valid_amount_reduces_balance() {
         125,
         "valid withdrawal must reduce pool balance by the withdrawn amount"
     );
+}
+
+// ── Issue #628: pause / resume status transitions and maintenance events ──────
+//
+// Operators and event consumers rely on dependable state transitions during
+// maintenance windows. The local administrator fixture (the `admin` address
+// initialised by `setup_contract`) is promoted to the Pauser role and drives
+// each transition, so the emitted maintenance events carry that fixture as
+// their `admin` topic. Each test exercises the `is_paused` status getter
+// across a transition and decodes the documented maintenance event (its
+// topic symbol and `admin` payload) by comparing the emitted XDR against the
+// `Event::to_xdr` projection of the same struct the contract publishes.
+
+#[test]
+fn test_pause_status_transition_and_emits_paused_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(LinkoraContract, ());
+    let client = LinkoraContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &0);
+
+    // The status getter reflects the initial (running) state.
+    assert!(!client.is_paused(), "contract must start unpaused");
+
+    // Promote the local administrator fixture to the Pauser role, then pause.
+    client.grant_role(&admin, &admin, &Role::Pauser);
+
+    let events_before = env.events().all().events().len();
+    client.pause(&admin);
+
+    // The status getter reflects the transition to paused.
+    assert!(client.is_paused(), "status must be paused after pause");
+
+    // Exactly one new event, whose topics (paused_event, admin) and data
+    // match the documented PausedEvent fixture.
+    let events = env.events().all().events();
+    assert_eq!(events.len(), events_before + 1, "pause emits one event");
+    let expected_event = PausedEvent { admin: admin.clone() };
+    let expected = expected_event.to_xdr(&env, &contract_id);
+    assert_eq!(
+        events.last().unwrap(),
+        &expected,
+        "PausedEvent topics and data must match the maintenance-event fixture"
+    );
+}
+
+#[test]
+fn test_unpause_status_transition_and_emits_unpaused_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(LinkoraContract, ());
+    let client = LinkoraContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &0);
+
+    // Promote the fixture to Pauser, pause, then resume.
+    client.grant_role(&admin, &admin, &Role::Pauser);
+    client.pause(&admin);
+    assert!(client.is_paused());
+
+    let events_before = env.events().all().events().len();
+    client.unpause(&admin);
+
+    // The status getter reflects the transition back to running.
+    assert!(!client.is_paused(), "status must be unpaused after unpause");
+
+    let events = env.events().all().events();
+    assert_eq!(events.len(), events_before + 1, "unpause emits one event");
+    let expected_event = UnpausedEvent { admin: admin.clone() };
+    let expected = expected_event.to_xdr(&env, &contract_id);
+    assert_eq!(
+        events.last().unwrap(),
+        &expected,
+        "UnpausedEvent topics and data must match the maintenance-event fixture"
+    );
+}
+
+#[test]
+fn test_pause_resume_roundtrip_status_returns_to_running() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup_contract(&env);
+    client.grant_role(&admin, &admin, &Role::Pauser);
+
+    // Full maintenance cycle: running -> paused -> running, observed through
+    // the status getter at every step.
+    assert!(!client.is_paused());
+    client.pause(&admin);
+    assert!(client.is_paused());
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "already paused")]
+fn test_pause_when_already_paused_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup_contract(&env);
+    client.grant_role(&admin, &admin, &Role::Pauser);
+    client.pause(&admin);
+    client.pause(&admin);
+}
+
+#[test]
+#[should_panic(expected = "not paused")]
+fn test_unpause_when_not_paused_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup_contract(&env);
+    client.grant_role(&admin, &admin, &Role::Pauser);
+    client.unpause(&admin);
+}
+
+#[test]
+#[should_panic(expected = "Pauser role required")]
+fn test_pause_requires_pauser_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _) = setup_contract(&env);
+    // An account with no roles cannot drive the maintenance transition.
+    let nobody = Address::generate(&env);
+    client.pause(&nobody);
+}
+
+#[test]
+#[should_panic(expected = "contract is paused")]
+fn test_pause_blocks_state_mutating_calls() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup_contract(&env);
+    client.grant_role(&admin, &admin, &Role::Pauser);
+    client.pause(&admin);
+
+    // While paused, state-mutating calls must be rejected so maintenance is
+    // observable to operators and event consumers alike.
+    let author = Address::generate(&env);
+    client.create_post(&author, &String::from_str(&env, "while paused"));
 }
